@@ -1,3 +1,5 @@
+> This is a fork of `dudanov/hassio-ftms` adapted for the self-powered Domyos/Decathlon EB900 B bike.  
+
 # Fitness Machine Service
 
 [Home Assistant](https://www.home-assistant.io/) [HACS](https://hacs.xyz/) custom component for working with fitness equipment with a Bluetooth interface.
