@@ -47,4 +47,9 @@ class FtmsEntity(CoordinatorEntity[DataCoordinator], Entity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        pass
+        """Handle coordinator update.
+    
+        Even when there is no new FTMS value, write the HA state so that
+        availability changes are reflected immediately.
+        """
+        self.async_write_ha_state()

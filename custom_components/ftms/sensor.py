@@ -313,13 +313,22 @@ class FtmsSensorEntity(FtmsEntity, SensorEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-
+        """Handle updated data from the coordinator.
+    
+        Always write state so availability changes are reflected immediately.
+        Only update the stored sensor value when connected and when real FTMS
+        data is received.
+        """
         e = self.coordinator.data
-
-        if e.event_id == "update" and (value := e.event_data.get(self.key)) is not None:
+    
+        if (
+            self.ftms.is_connected
+            and e is not None
+            and e.event_id == "update"
+            and (value := e.event_data.get(self.key)) is not None
+        ):
             if isinstance(value, Enum):
                 value = value.name.lower()
-
             self._attr_native_value = value
-            self.async_write_ha_state()
+    
+        self.async_write_ha_state()
