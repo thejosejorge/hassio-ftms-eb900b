@@ -1,5 +1,6 @@
-"""FTMS integration button platform."""
+"""FTMS integration number platform."""
 
+import asyncio
 import dataclasses as dc
 import logging
 
@@ -15,6 +16,8 @@ from pyftms.client import const as c
 
 from . import FtmsConfigEntry
 from .entity import FtmsEntity
+
+EB900B_UART_WRITE_UUID = "49535343-8841-43f4-a8d4-ecbe34729bb3"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,12 +84,111 @@ async def async_setup_entry(
 
 
 class FtmsNumberEntity(FtmsEntity, NumberEntity):
-    """Representation of FTMS numbers."""
-
+    """Representation of FTMS numbers.
+    
+    The EB900 B reports standard FTMS target resistance support, but rejects
+    the standard FTMS control point command. Kinomap controls resistance through
+    this proprietary UART-like characteristic instead.
+    """
+    async def _async_eb900b_set_resistance(self, level: int) -> None:
+        """Set EB900 B resistance using the proprietary Domyos/Kinomap UART command."""
+        level = max(1, min(15, int(level)))
+    
+        cli = self.ftms._cli
+        controller = self.ftms._controller
+    
+        write_char = None
+        for service in cli.services:
+            for char in service.characteristics:
+                if str(char.uuid).lower() == EB900B_UART_WRITE_UUID:
+                    write_char = char
+                    break
+            if write_char is not None:
+                break
+    
+        if write_char is None:
+            raise RuntimeError(
+                "EB900 B proprietary UART write characteristic not available"
+            )
+    
+        if not hasattr(self, "_eb900b_sequence"):
+            self._eb900b_sequence = 0x1C
+        else:
+            self._eb900b_sequence = (self._eb900b_sequence + 1) & 0xFF
+    
+        sequence = self._eb900b_sequence
+    
+        ad_without_checksum = (
+            bytes([0xF0, 0xAD])
+            + bytes([0xFF] * 8)
+            + bytes([level])
+            + bytes([0xFF] * 11)
+        )
+        ad_checksum = sum(ad_without_checksum) & 0xFF
+        ad_full = ad_without_checksum + bytes([ad_checksum])
+    
+        ad_part_1 = ad_full[:20]
+        ad_part_2 = ad_full[20:]
+    
+        first_payload = (
+            bytes([0xF0, 0xCB, 0x03, 0x00, sequence])
+            + bytes.fromhex("ff ff ff ff ff ff ff ff ff 01 00 3a 00 01 00")
+        )
+    
+        second_payload_without_checksum = bytes([
+            0x01,
+            0x00,
+            0x01,
+            0x00,
+            level,
+            0x00,
+        ])
+    
+        checksum = sum(first_payload + second_payload_without_checksum) & 0xFF
+        second_payload = second_payload_without_checksum + bytes([checksum])
+    
+        _LOGGER.debug(
+            "Setting EB900 B resistance using proprietary command: level=%s sequence=%s",
+            level,
+            sequence,
+        )
+    
+        async with controller._write_lock:
+            await cli.write_gatt_char(write_char, ad_part_1, response=True)
+            await asyncio.sleep(0.03)
+    
+            await cli.write_gatt_char(write_char, ad_part_2, response=True)
+            await asyncio.sleep(0.05)
+    
+            await cli.write_gatt_char(write_char, first_payload, response=True)
+            await asyncio.sleep(0.05)
+    
+            await cli.write_gatt_char(write_char, second_payload, response=True)
+        
     async def async_set_native_value(self, value: float) -> None:
         """Update the current value from HA."""
-
-        await self.ftms.set_setting(self.key, value)
+        if self.key == c.TARGET_RESISTANCE:
+            level = int(round(value))
+    
+            try:
+                await self._async_eb900b_set_resistance(level)
+    
+            except Exception:
+                _LOGGER.exception(
+                    "Failed to set EB900 B resistance using proprietary command: level=%s",
+                    level,
+                )
+                raise
+    
+            self._attr_native_value = float(level)
+            self.async_write_ha_state()
+            return
+    
+        result = await self.ftms.set_setting(self.key, value)
+    
+        if str(result).lower().endswith("success"):
+            self._attr_native_value = value
+            self.async_write_ha_state()
 
     @callback
     def _handle_coordinator_update(self) -> None:

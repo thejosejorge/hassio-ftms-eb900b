@@ -1,10 +1,12 @@
 """The FTMS integration."""
 
+from functools import wraps
 import asyncio
 import logging
 from datetime import timedelta
 
 import pyftms
+import pyftms.client.client as pyftms_client
 from bleak.exc import BleakError
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import BluetoothCallbackMatcher
@@ -37,6 +39,8 @@ RECONNECT_INTERVAL = timedelta(seconds=10)
 
 type FtmsConfigEntry = ConfigEntry[FtmsData]
 
+EB900B_UART_SERVICE_UUID = "49535343-FE7D-4AE5-8FA9-9FAFD205E455"
+EB900B_VENDOR_SERVICE_UUID = "02F00000-0000-0000-0000-00000000FE00"
 
 async def async_unload_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> bool:
     """Unload a config entry."""
@@ -47,9 +51,43 @@ async def async_unload_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> boo
 
     return unload_ok
 
+def _patch_pyftms_ble_services() -> None:
+    """Patch pyftms BLE connection to also discover EB900 B vendor services.
+
+    pyftms normally limits service discovery to FTMS and Device Information.
+    EB900 B resistance control uses a proprietary UART-like service, so that
+    service must also be discovered by Bleak.
+    """
+    if getattr(pyftms_client, "_eb900b_services_patch_applied", False):
+        return
+
+    original_establish_connection = pyftms_client.establish_connection
+
+    @wraps(original_establish_connection)
+    async def _establish_connection_with_eb900b_services(*args, **kwargs):
+        services = kwargs.get("services")
+
+        if services is not None:
+            merged_services = list(services)
+            existing = {str(service).lower() for service in merged_services}
+
+            for service in (
+                EB900B_UART_SERVICE_UUID,
+                EB900B_VENDOR_SERVICE_UUID,
+            ):
+                if service.lower() not in existing:
+                    merged_services.append(service)
+
+            kwargs["services"] = merged_services
+
+        return await original_establish_connection(*args, **kwargs)
+
+    pyftms_client.establish_connection = _establish_connection_with_eb900b_services
+    pyftms_client._eb900b_services_patch_applied = True
 
 async def async_setup_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> bool:
     """Set up device from a config entry."""
+    _patch_pyftms_ble_services()
 
     address: str = entry.data[CONF_ADDRESS]
 
@@ -58,7 +96,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> bool
 
     def _on_disconnect(ftms_: pyftms.FitnessMachine) -> None:
         """Disconnect handler.
-    
+
         Do not reload the config entry when a self-powered machine turns off.
         Mark the entities unavailable and let the reconnect loop bring it back.
         """
@@ -66,12 +104,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> bool
             "FTMS device %s disconnected; marking entities unavailable",
             ftms_.address,
         )
-    
+
         hass.loop.call_soon_threadsafe(
             coordinator.async_set_update_error,
             ConnectionError("FTMS device temporarily unavailable"),
         )
-            
+
     try:
         ftms = pyftms.get_client(
             srv_info.device,
@@ -85,8 +123,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> bool
     coordinator = DataCoordinator(hass, ftms)
 
     connect_task: asyncio.Task | None = None
-    
-    
+
+    @callback
+    def _cancel_connect_task() -> None:
+        """Cancel pending reconnect task."""
+        nonlocal connect_task
+
+        if connect_task is not None:
+            connect_task.cancel()
+            connect_task = None
+
+    entry.async_on_unload(_cancel_connect_task)
+
     async def _async_try_reconnect() -> None:
         """Try to reconnect to the FTMS device."""
         nonlocal connect_task
@@ -172,17 +220,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> bool
 
     assert ftms.machine_type.name
 
-    _LOGGER.debug(f"Device Information: {ftms.device_info}")
-    _LOGGER.debug(f"Machine type: {ftms.machine_type.name}")
-    _LOGGER.debug(f"Available sensors: {ftms.available_properties}")
-    _LOGGER.debug(f"Supported settings: {ftms.supported_settings}")
-    _LOGGER.debug(f"Supported ranges: {ftms.supported_ranges}")
+    _LOGGER.debug("Device Information: %s", ftms.device_info)
+    _LOGGER.debug("Machine type: %s", ftms.machine_type.name)
+    _LOGGER.debug("Available sensors: %s", ftms.available_properties)
+    _LOGGER.debug("Supported settings: %s", ftms.supported_settings)
+    _LOGGER.debug("Supported ranges: %s", ftms.supported_ranges)
 
     unique_id = "".join(
         x for x in ftms.device_info.get("serial_number", address) if x.isalnum()
     ).lower()
 
-    _LOGGER.debug(f"Registered new FTMS device. UniqueID is '{unique_id}'.")
+    _LOGGER.debug("Registered new FTMS device. UniqueID is '%s'.", unique_id)
 
     device_info = dr.DeviceInfo(
         connections={(dr.CONNECTION_BLUETOOTH, ftms.address)},
