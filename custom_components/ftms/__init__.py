@@ -120,6 +120,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> bool
     except pyftms.NotFitnessMachineError:
         raise ConfigEntryNotReady(translation_key="ftms_error")
 
+    original_pyftms_on_disconnect = ftms._on_disconnect
+
+    def _safe_pyftms_on_disconnect(cli) -> None:
+        """Handle duplicate/tardy pyftms disconnect callbacks safely."""
+        if not hasattr(ftms, "_cli"):
+            _LOGGER.debug(
+                "Ignoring duplicate pyftms disconnect callback for %s",
+                getattr(ftms, "address", address),
+            )
+            return
+
+        original_pyftms_on_disconnect(cli)
+
+    ftms._on_disconnect = _safe_pyftms_on_disconnect
+
     coordinator = DataCoordinator(hass, ftms)
 
     connect_task: asyncio.Task | None = None
