@@ -1,9 +1,7 @@
 """The FTMS integration."""
 
 from functools import wraps
-import asyncio
 import logging
-from datetime import timedelta
 
 import pyftms
 import pyftms.client.client as pyftms_client
@@ -20,7 +18,6 @@ from homeassistant.const import (
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.event import async_track_time_interval
 
 from .const import DOMAIN
 from .coordinator import DataCoordinator
@@ -34,8 +31,6 @@ PLATFORMS: list[Platform] = [
 ]
 
 _LOGGER = logging.getLogger(__name__)
-
-RECONNECT_INTERVAL = timedelta(seconds=10)
 
 type FtmsConfigEntry = ConfigEntry[FtmsData]
 
@@ -96,19 +91,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> bool
 
     def _on_disconnect(ftms_: pyftms.FitnessMachine) -> None:
         """Disconnect handler.
-
-        Do not reload the config entry when a self-powered machine turns off.
-        Mark the entities unavailable and let the reconnect loop bring it back.
+    
+        Reload entry on disconnect.
         """
-        _LOGGER.debug(
-            "FTMS device %s disconnected; marking entities unavailable",
-            ftms_.address,
-        )
-
-        hass.loop.call_soon_threadsafe(
-            coordinator.async_set_update_error,
-            ConnectionError("FTMS device temporarily unavailable"),
-        )
+        if ftms_.need_connect:
+            hass.config_entries.async_schedule_reload(entry.entry_id)
 
     try:
         ftms = pyftms.get_client(
@@ -136,96 +123,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> bool
     ftms._on_disconnect = _safe_pyftms_on_disconnect
 
     coordinator = DataCoordinator(hass, ftms)
-
-    connect_task: asyncio.Task | None = None
-
-    @callback
-    def _cancel_connect_task() -> None:
-        """Cancel pending reconnect task."""
-        nonlocal connect_task
-
-        if connect_task is not None:
-            connect_task.cancel()
-            connect_task = None
-
-    entry.async_on_unload(_cancel_connect_task)
-
-    async def _async_try_reconnect() -> None:
-        """Try to reconnect to the FTMS device."""
-        nonlocal connect_task
-    
-        try:
-            if ftms.is_connected:
-                return
-    
-            _LOGGER.debug("Checking if FTMS device %s is available", address)
-    
-            bluetooth.async_rediscover_address(hass, address)
-    
-            srv_info = bluetooth.async_last_service_info(hass, address)
-            if srv_info is None:
-                _LOGGER.debug(
-                    "FTMS device %s has no recent BLE advertisement yet",
-                    address,
-                )
-                coordinator.async_set_update_error(
-                    ConnectionError("FTMS device not advertising")
-                )
-                return
-    
-            ftms.set_ble_device_and_advertisement_data(
-                srv_info.device,
-                srv_info.advertisement,
-            )
-    
-            _LOGGER.debug("Trying to reconnect to FTMS device %s", address)
-            await ftms.connect()
-            
-            _LOGGER.debug("Reconnected to FTMS device %s", address)
-            
-            # Clear the coordinator error immediately after a successful reconnect.
-            # Without this, entities may remain unavailable until the next FTMS event.
-            coordinator.async_set_updated_data(coordinator.data)
-    
-        except BleakError as exc:
-            _LOGGER.debug(
-                "FTMS reconnect failed for %s; keeping entities unavailable",
-                address,
-                exc_info=exc,
-            )
-            coordinator.async_set_update_error(exc)
-    
-        except Exception as exc:
-            _LOGGER.debug(
-                "Unexpected FTMS reconnect error for %s",
-                address,
-                exc_info=exc,
-            )
-            coordinator.async_set_update_error(exc)
-    
-        finally:
-            connect_task = None
-    
-    
-    def _schedule_reconnect() -> None:
-        """Schedule a reconnect attempt from the Home Assistant event loop."""
-        hass.loop.call_soon_threadsafe(_async_schedule_reconnect)
-        
-    @callback
-    def _async_schedule_reconnect() -> None:
-        """Schedule a reconnect attempt.
-    
-        This runs inside the Home Assistant event loop.
-        """
-        nonlocal connect_task
-    
-        if ftms.is_connected:
-            return
-    
-        if connect_task is not None:
-            return
-    
-        connect_task = hass.async_create_task(_async_try_reconnect())
 
     try:
         await ftms.connect()
@@ -268,15 +165,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> bool
         srv_info: bluetooth.BluetoothServiceInfoBleak,
         change: bluetooth.BluetoothChange,
     ) -> None:
-        """Update from a BLE callback and reconnect if needed."""
+        """Update from a BLE callback."""
         ftms.set_ble_device_and_advertisement_data(
             srv_info.device,
             srv_info.advertisement,
         )
-    
-        _LOGGER.debug("BLE advertisement received from FTMS device %s", address)
-    
-        _schedule_reconnect()
         
     entry.async_on_unload(
         bluetooth.async_register_callback(
@@ -284,14 +177,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: FtmsConfigEntry) -> bool
             _async_on_ble_event,
             BluetoothCallbackMatcher(address=address),
             bluetooth.BluetoothScanningMode.ACTIVE,
-        )
-    )
-    
-    entry.async_on_unload(
-        async_track_time_interval(
-            hass,
-            lambda now: _schedule_reconnect(),
-            RECONNECT_INTERVAL,
         )
     )
 

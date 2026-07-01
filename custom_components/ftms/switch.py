@@ -1,6 +1,5 @@
 """FTMS integration switch platform."""
 
-import logging
 from typing import Any, override
 
 from bleak.exc import BleakError
@@ -10,15 +9,12 @@ from homeassistant.components.switch import (
     SwitchEntityDescription,
 )
 from homeassistant.const import STATE_OFF, EntityCategory
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from . import FtmsConfigEntry
 from .entity import FtmsEntity
-
-_LOGGER = logging.getLogger(__name__)
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -38,7 +34,6 @@ async def async_setup_entry(
 
     async_add_entities([connection_switch])
 
-
 class ConnectionSwitchEntity(FtmsEntity, SwitchEntity, RestoreEntity):
     """Representation of FTMS connection switch."""
 
@@ -56,30 +51,14 @@ class ConnectionSwitchEntity(FtmsEntity, SwitchEntity, RestoreEntity):
 
     @override
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the entity on.
-    
-        Turning this switch on means Home Assistant should keep trying to connect.
-        It may still be unavailable until the bike wakes up and advertises over BLE.
-        """
-        self._attr_is_on = True
-        self.async_write_ha_state()
-    
+        """Turn the entity on."""
         try:
             await self.ftms.connect()
-    
-        except BleakError as exc:
-            _LOGGER.debug(
-                "FTMS manual reconnect failed for %s; keeping connection wanted",
-                self.ftms.address,
-                exc_info=exc,
-            )
-            self.coordinator.async_set_update_error(exc)
-    
-        else:
-            # Clear previous unavailable/error state after a successful manual connect.
-            self.coordinator.async_set_updated_data(self.coordinator.data)
-    
-        self.async_write_ha_state()
+        except BleakError:
+            self.hass.config_entries.async_schedule_reload(self._data.entry_id)
+        finally:
+            self._attr_is_on = True
+            self.async_write_ha_state()
 
     @override
     async def async_turn_off(self, **kwargs: Any) -> None:
@@ -87,16 +66,6 @@ class ConnectionSwitchEntity(FtmsEntity, SwitchEntity, RestoreEntity):
 
         await self.ftms.disconnect()
         self._attr_is_on = False
-        self.async_write_ha_state()
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle coordinator update.
-    
-        The switch represents the desired connection state, not the current
-        Bluetooth connection state. Keep it On while reconnection is wanted.
-        """
-        self._attr_is_on = self.ftms.need_connect
         self.async_write_ha_state()
 
     @property

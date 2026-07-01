@@ -1,6 +1,5 @@
 """FTMS integration sensor platform."""
 
-import logging
 from enum import Enum
 
 from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
@@ -19,8 +18,6 @@ from pyftms.client import const as c
 
 from . import FtmsConfigEntry
 from .entity import FtmsEntity
-
-_LOGGER = logging.getLogger(__name__)
 
 _CADENCE_AVERAGE = SensorEntityDescription(
     key=c.CADENCE_AVERAGE,
@@ -309,22 +306,11 @@ class FtmsSensorEntity(FtmsEntity, SensorEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator.
-    
-        Always write state so availability changes are reflected immediately.
-        Only update the stored sensor value when connected and when real FTMS
-        data is received.
-        """
+        """Handle updated data from the coordinator."""
         e = self.coordinator.data
     
-        if (
-            self.ftms.is_connected
-            and e is not None
-            and e.event_id == "update"
-            and (value := e.event_data.get(self.key)) is not None
-        ):
+        if e.event_id == "update" and (value := e.event_data.get(self.key)) is not None:
             if isinstance(value, Enum):
                 value = value.name.lower()
             self._attr_native_value = value
-    
-        self.async_write_ha_state()
+            self.async_write_ha_state()
