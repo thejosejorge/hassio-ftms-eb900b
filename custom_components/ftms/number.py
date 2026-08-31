@@ -31,6 +31,30 @@ EB900B_VERIFY_SECONDS = 2.50
 # How long to prefer fresh proprietary UART resistance telemetry over FTMS.
 EB900B_UART_FRESH_SECONDS = 1.50
 
+EB900B_KEEPALIVE_PACKET = bytes.fromhex("f0 ac 9c")
+EB900B_STATUS_PACKET_PREFIXES = (b"\xf0\xbc", b"\xf0\xdb", b"\xf0\xdd")
+EB900B_INIT_PACKETS = (
+    bytes.fromhex("f0 c8 01 b9"),
+    bytes.fromhex("f0 c9 b9"),
+    bytes.fromhex("f0 a3 93"),
+    bytes.fromhex("f0 a4 94"),
+    bytes.fromhex("f0 a5 95"),
+    bytes.fromhex("f0 ab 9b"),
+    bytes.fromhex("f0 c4 03 b7"),
+    bytes.fromhex(
+        "f0 ad ff ff ff ff ff ff ff ff "
+        "ff ff ff ff ff ff ff ff 01 ff ff ff 8b"
+    ),
+    bytes.fromhex(
+        "f0 cb 02 00 08 ff ff ff ff ff "
+        "ff ff ff ff ff ff ff ff 01 00 00 01 ff ff ff ff b6"
+    ),
+    bytes.fromhex(
+        "f0 ad ff ff 00 05 ff ff ff ff "
+        "ff ff ff 00 00 ff ff ff 01 ff ff ff 94"
+    ),
+)
+
 _LOGGER = logging.getLogger(__name__)
 
 _NUMBERS_SENSORS_MAP = {
@@ -126,10 +150,9 @@ class FtmsNumberEntity(FtmsEntity, NumberEntity):
 
     @callback
     def _eb900b_uart_notify(self, sender, data) -> None:
-        """Handle proprietary Domyos UART notifications."""
+        """Handle proprietary Domyos UART resistance notifications."""
         del sender
         payload = bytes(data)
-        now = time.monotonic()
 
         # Some bikes split a 26-byte status packet into 20 + 6 bytes.
         partial = getattr(self, "_eb900b_uart_partial", b"")
@@ -137,36 +160,18 @@ class FtmsNumberEntity(FtmsEntity, NumberEntity):
         if partial:
             payload = partial + payload
             self._eb900b_uart_partial = b""
-        elif (
-            len(payload) == 20
-            and payload[:2] in (b"\xf0\xbc", b"\xf0\xdb", b"\xf0\xdd")
-        ):
+        elif len(payload) == 20 and payload[:2] in EB900B_STATUS_PACKET_PREFIXES:
             self._eb900b_uart_partial = payload
             return
 
-        self._eb900b_last_uart_packet = payload
-        self._eb900b_last_uart_time = now
+        if len(payload) != 26:
+            return
 
-        # QZ decodes cadence from byte 9 and resistance from byte 14 in the
-        # 26-byte proprietary status packet.
-        if len(payload) == 26:
-            cadence = payload[9]
-            resistance = payload[14]
-
-            self._eb900b_uart_cadence = cadence
-
-            if 1 <= resistance <= 15:
-                self._eb900b_uart_actual_resistance = resistance
-                self._eb900b_uart_actual_time = now
-
-            _LOGGER.debug(
-                "EB900 B UART status: cadence=%s resistance=%s raw=%s",
-                cadence,
-                resistance,
-                payload.hex(" "),
-            )
-        else:
-            _LOGGER.debug("EB900 B UART notify: %s", payload.hex(" "))
+        # QZ decodes resistance from byte 14 in the proprietary status packet.
+        resistance = payload[14]
+        if 1 <= resistance <= 15:
+            self._eb900b_uart_actual_resistance = resistance
+            self._eb900b_uart_actual_time = time.monotonic()
 
     async def _async_eb900b_write_packet(
         self,
@@ -200,8 +205,7 @@ class FtmsNumberEntity(FtmsEntity, NumberEntity):
                     raise RuntimeError("BLE client disconnected")
 
                 await self._async_eb900b_write_packet(
-                    write_char,
-                    bytes.fromhex("f0 ac 9c"),
+                    write_char, EB900B_KEEPALIVE_PACKET
                 )
 
         except asyncio.CancelledError:
@@ -250,56 +254,15 @@ class FtmsNumberEntity(FtmsEntity, NumberEntity):
             self._eb900b_uart_partial = b""
 
             if not getattr(self, "_eb900b_notify_started", False):
-                await cli.start_notify(
-                    notify_char,
-                    self._eb900b_uart_notify,
-                )
+                await cli.start_notify(notify_char, self._eb900b_uart_notify)
                 self._eb900b_notify_started = True
                 await asyncio.sleep(0.20)
 
             # btinit_changyow(false) from QZ, expressed as logical packets.
-            init_packets = (
-                ("C8", bytes.fromhex("f0 c8 01 b9")),
-                ("C9", bytes.fromhex("f0 c9 b9")),
-                ("A3", bytes.fromhex("f0 a3 93")),
-                ("A4", bytes.fromhex("f0 a4 94")),
-                ("A5", bytes.fromhex("f0 a5 95")),
-                ("AB", bytes.fromhex("f0 ab 9b")),
-                ("C4", bytes.fromhex("f0 c4 03 b7")),
-                (
-                    "AD-1",
-                    bytes.fromhex(
-                        "f0 ad ff ff ff ff ff ff ff ff "
-                        "ff ff ff ff ff ff ff ff 01 ff "
-                        "ff ff 8b"
-                    ),
-                ),
-                (
-                    "CB",
-                    bytes.fromhex(
-                        "f0 cb 02 00 08 ff ff ff ff ff "
-                        "ff ff ff ff ff ff ff ff 01 00 "
-                        "00 01 ff ff ff ff b6"
-                    ),
-                ),
-                (
-                    "AD-2",
-                    bytes.fromhex(
-                        "f0 ad ff ff 00 05 ff ff ff ff "
-                        "ff ff ff 00 00 ff ff ff 01 ff "
-                        "ff ff 94"
-                    ),
-                ),
-            )
-
             _LOGGER.debug("EB900 B QZ-style UART initialisation starting")
 
-            for label, packet in init_packets:
-                await self._async_eb900b_write_packet(
-                    write_char,
-                    packet,
-                )
-                _LOGGER.debug("EB900 B UART init step sent: %s", label)
+            for packet in EB900B_INIT_PACKETS:
+                await self._async_eb900b_write_packet(write_char, packet)
                 await asyncio.sleep(0.30)
 
             self._eb900b_qz_initialized = True
@@ -308,7 +271,7 @@ class FtmsNumberEntity(FtmsEntity, NumberEntity):
 
             task = getattr(self, "_eb900b_keepalive_task", None)
             if task is None or task.done():
-                self._eb900b_keepalive_task = asyncio.create_task(
+                self._eb900b_keepalive_task = self.hass.async_create_task(
                     self._async_eb900b_keepalive(cli, write_char)
                 )
 
@@ -374,12 +337,7 @@ class FtmsNumberEntity(FtmsEntity, NumberEntity):
 
         packet = self._eb900b_build_resistance_packet(level)
 
-        await self._async_eb900b_write_packet(
-            write_char,
-            packet,
-        )
-
-        _LOGGER.debug("EB900 B resistance command sent: R%s", level)
+        await self._async_eb900b_write_packet(write_char, packet)
 
     def _eb900b_current_actual_resistance(self):
         """Return the freshest known physical resistance."""
@@ -485,7 +443,7 @@ class FtmsNumberEntity(FtmsEntity, NumberEntity):
         if old_task is not None and not old_task.done():
             old_task.cancel()
 
-        self._eb900b_verify_task = asyncio.create_task(
+        self._eb900b_verify_task = self.hass.async_create_task(
             self._async_eb900b_verify_target(level)
         )
 
